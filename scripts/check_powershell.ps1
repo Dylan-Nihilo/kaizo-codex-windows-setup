@@ -13,8 +13,12 @@ stale = 'http://srt:fixture@localhost:64321'
 samples.append(setup.profile_cleanup('$env:HTTP_PROXY="' + stale + '"\n', {stale}))
 print(json.dumps(samples))
 '@
-$all=& python -X utf8 -c $extract $repo | ConvertFrom-Json
-if($LASTEXITCODE -ne 0){throw 'Could not extract embedded PowerShell scripts.'}
+$extractFile=[IO.Path]::GetTempFileName()
+try {
+    [IO.File]::WriteAllText($extractFile, $extract, (New-Object Text.UTF8Encoding($false)))
+    $all=& python -X utf8 $extractFile $repo | ConvertFrom-Json
+    if($LASTEXITCODE -ne 0){throw 'Could not extract embedded PowerShell scripts.'}
+} finally { Remove-Item -LiteralPath $extractFile -Force }
 $i=0
 foreach($script in $all){
     $tokens=$null; $parseErrors=$null
