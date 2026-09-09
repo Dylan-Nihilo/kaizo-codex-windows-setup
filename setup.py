@@ -3,6 +3,8 @@ import argparse
 import base64
 import contextlib
 import ctypes
+import copy
+import datetime
 from ctypes import wintypes
 import getpass
 import hashlib
@@ -10,7 +12,6 @@ import json
 import logging
 import os
 from pathlib import Path
-import queue
 import re
 import shutil
 import socket
@@ -33,9 +34,9 @@ PROVIDER = 'kaizo-codex-astra-medium'
 PERSONAL_PROVIDER = 'kaizo-personal-account'
 PROXIES = ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy')
 STEPS = ('检查 Windows 与代理', '准备 ChatGPT / Codex', '准备 CC Switch', '备份原配置',
-         '配置 KAIZO 与工作规范', '验证登录与模型回复', '打开应用')
+         '配置 KAIZO 与工作规范', '核对配置文件', '完成配置')
 ROOT = Path(__file__).resolve().parent
-VERSION = '2.3.0'
+VERSION = '2.4.0'
 LOG = logging.getLogger('kaizo.setup')
 LOG.setLevel(logging.INFO)
 LOG.propagate = False
@@ -402,68 +403,6 @@ class Backup:
         LOG.info('ROLLBACK_DONE directory=%s', self.directory)
 
 
-class Rpc:
-    def __init__(self, binary, cwd):
-        command = list(binary) if isinstance(binary, (list, tuple)) else [str(binary)]
-        self.proc = start_process(command + ['app-server'], cwd=cwd, stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace',
-            creationflags=0x08000000 if os.name == 'nt' else 0)
-        self.events = queue.Queue()
-        self.ident = 0
-        threading.Thread(target=self.read, daemon=True).start()
-        threading.Thread(target=lambda: self.proc.stderr.read(), daemon=True).start()
-        try:
-            self.call('initialize', {'clientInfo': {'name': 'kaizo_setup', 'title': 'KAIZO Setup', 'version': '2.0'}})
-            self.write({'method': 'initialized', 'params': {}})
-        except BaseException:
-            self.close()
-            raise
-
-    def read(self):
-        for line in self.proc.stdout:
-            try:
-                self.events.put(json.loads(line))
-            except json.JSONDecodeError:
-                pass
-        self.events.put(None)
-
-    def write(self, message):
-        self.proc.stdin.write(json.dumps(message, ensure_ascii=False) + '\n')
-        self.proc.stdin.flush()
-
-    def call(self, method, params):
-        self.ident += 1
-        started = time.monotonic()
-        LOG.info('RPC_START method=%s id=%s', method, self.ident)
-        self.write({'id': self.ident, 'method': method, 'params': params})
-        deadline = time.monotonic() + 45
-        while True:
-            try:
-                message = self.events.get(timeout=max(0, deadline-time.monotonic()))
-            except queue.Empty:
-                raise Failure(f'Codex 的 {method} 响应超时。') from None
-            if message is None:
-                raise Failure('Codex 配置服务提前退出；请检查桌面应用是否完整安装。')
-            if message.get('id') == self.ident:
-                if 'error' in message:
-                    raise Failure(f'Codex 拒绝 {method}，错误码 {message["error"].get("code")}。')
-                LOG.info('RPC_DONE method=%s elapsed=%.1fs', method, time.monotonic()-started)
-                return message['result']
-
-    def close(self):
-        try:
-            self.proc.stdin.close()
-            self.proc.wait(timeout=3)
-        except (OSError, subprocess.TimeoutExpired):
-            stop_child(self.proc)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_args):
-        self.close()
-
-
 def edits(key, auth_store='file'):
     values = {'model_provider': 'custom', 'model': MODEL, 'model_reasoning_effort': 'medium',
         'service_tier': None, 'features.fast_mode': False, 'personality': 'none', 'profile': None,
@@ -482,24 +421,12 @@ def verify_config(config, key, auth_store='file'):
     valid &= all(provider.get(k) == v for k, v in {'base_url': BASE, 'wire_api': 'responses',
         'requires_openai_auth': True, 'experimental_bearer_token': key, 'supports_websockets': False}.items())
     if not valid:
-        raise Failure('生效配置与 Astra / Medium / Fast OFF 不一致，可能存在配置档或策略覆盖。')
+        raise Failure('配置文件与 Astra / Medium / Fast OFF 不一致。')
 
 
 def has_auth_material(auth):
     return any(auth.get(name) for name in ('OPENAI_API_KEY', 'tokens', 'personal_access_token',
                                           'agent_identity', 'bedrock_api_key', 'bedrock_access_keys'))
-
-
-def verify_account(rpc, expected=None, allow_missing=False):
-    state = rpc.call('account/read', {'refreshToken': False})
-    account = state.get('account')
-    if not account and allow_missing and state.get('requiresOpenaiAuth'):
-        return None
-    if not isinstance(account, dict) or account.get('type') not in ('apiKey', 'chatgpt') or not state.get('requiresOpenaiAuth'):
-        raise Failure('Codex 未识别持久登录状态，不会标记为成功。')
-    if expected and any(expected.get(field) != account.get(field) for field in ('type', 'email')):
-        raise Failure('原有账户状态发生变化，已停止，避免覆盖个人登录。')
-    return account
 
 
 def check_db(path):
@@ -522,51 +449,82 @@ def check_db(path):
             raise Failure('请在 CC Switch 关闭 Codex 本地路由和自动故障转移，再运行。')
 
 
-def configure(binary, work, codex, cc, key, agents):
+def toml_text(data):
+    # ponytail: stdlib TOML reader plus a value-preserving writer; backups retain comments/formatting.
+    def scalar(value):
+        if isinstance(value, str):
+            return json.dumps(value, ensure_ascii=False)
+        if isinstance(value, bool):
+            return 'true' if value else 'false'
+        if isinstance(value, (int, float)):
+            return repr(value)
+        if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+            return value.isoformat()
+        if isinstance(value, list):
+            return '[' + ', '.join(scalar(item) for item in value) + ']'
+        if isinstance(value, dict):
+            return '{' + ', '.join(json.dumps(k, ensure_ascii=False) + ' = ' + scalar(v) for k, v in value.items()) + '}'
+        raise Failure('配置含无法安全写入的 TOML 值，已停止。')
+    lines = []
+    def table(values, path):
+        if path:
+            lines.extend(['', '[' + '.'.join(json.dumps(k, ensure_ascii=False) for k in path) + ']'])
+        for name, value in values.items():
+            if not isinstance(value, dict):
+                lines.append(json.dumps(name, ensure_ascii=False) + ' = ' + scalar(value))
+        for name, value in values.items():
+            if isinstance(value, dict):
+                table(value, path + [name])
+    table(data, [])
+    text = '\n'.join(lines) + '\n'
+    tomllib.loads(text)
+    return text
+
+
+def configure(codex, cc, key, agents):
     path = codex / 'config.toml'
     original_config = path.read_text(encoding='utf-8-sig') if path.exists() else ''
+    previous = tomllib.loads(original_config)
     auth_path = codex / 'auth.json'
     original_auth = auth_path.read_bytes() if auth_path.exists() else None
     auth_value = json.loads(original_auth.decode('utf-8-sig')) if original_auth else {}
-    with Rpc(binary, work) as rpc:
-        before = rpc.call('config/read', {'includeLayers': True})
-        for layer in before.get('layers') or []:
-            source = layer.get('name') or layer.get('source') or {}
-            if source.get('type') == 'user' and (source.get('profile') or
-                (source.get('file') and os.path.normcase(os.path.abspath(source['file'])) != os.path.normcase(str(path)))):
-                raise Failure('Codex 配置目录或配置档与目标不一致。')
-        previous = before['config']
-        auth_store = previous.get('cli_auth_credentials_store') or 'file'
-        if auth_store not in ('file', 'keyring', 'auto'):
-            raise Failure('原登录使用临时凭据存储，无法安全保留；请先在桌面应用完成持久登录。')
-        official_route = (previous.get('model_provider') or 'openai') == 'openai' and not previous.get('openai_base_url')
-        result = rpc.call('config/batchWrite', {'edits': edits(key, auth_store), 'filePath': str(path)})
-        if result.get('status') != 'ok':
-            raise Failure('配置写入被更高优先级设置覆盖。')
-    private(path)
-    with Rpc(binary, work) as rpc:
-        effective = rpc.call('config/read', {'includeLayers': False})['config']
-        verify_config(effective, key, auth_store)
-        account = verify_account(rpc, allow_missing=True)
-        if effective.get('forced_login_method') == 'chatgpt' and (account or {}).get('type') != 'chatgpt':
-            raise Failure('当前策略要求 ChatGPT 账户；请先完成个人账户登录。')
-        if account is None:
-            # Never overwrite an unreadable/expired personal login or a Windows credential-store entry.
-            if auth_store != 'file' or has_auth_material(auth_value):
-                raise Failure('已有登录凭据未被 Codex 正确识别，已保留。请先在原应用重新登录，再运行本包。')
-            if rpc.call('account/login/start', {'type': 'apiKey', 'apiKey': key}).get('type') != 'apiKey':
-                raise Failure('Codex 没有完成原生 API Key 登录。')
-            account = verify_account(rpc)
-            if json.loads(auth_path.read_text(encoding='utf-8')).get('OPENAI_API_KEY') != key:
-                raise Failure('API Key 登录未保存到预期目录。')
-    if auth_path.exists():
-        private(auth_path)
-    config = path.read_text(encoding='utf-8')
+    if not isinstance(auth_value, dict):
+        raise Failure('已有 auth.json 结构无效；未覆盖登录文件。')
+    auth_store = previous.get('cli_auth_credentials_store') or 'file'
+    if auth_store not in ('file', 'keyring', 'auto'):
+        raise Failure('当前凭据存储方式不支持安全保留；未修改登录文件。')
+    official_route = (previous.get('model_provider') or 'openai') == 'openai' and not previous.get('openai_base_url')
+    with sqlite3.connect(cc / 'cc-switch.db') as db:
+        existing = db.execute("SELECT category FROM providers WHERE id=? AND app_type='codex'", (PERSONAL_PROVIDER,)).fetchone()
+        if existing and existing[0] != 'official':
+            raise Failure('个人账户条目与既有供应商 ID 冲突，未覆盖该条目。')
+    config_value = copy.deepcopy(previous)
+    for edit in edits(key, auth_store):
+        parts = edit['keyPath'].split('.')
+        target = config_value
+        for part in parts[:-1]:
+            target = target.setdefault(part, {})
+            if not isinstance(target, dict):
+                raise Failure('配置表结构无效，未写入。')
+        if edit['value'] is None:
+            target.pop(parts[-1], None)
+        else:
+            target[parts[-1]] = edit['value']
+    config = toml_text(config_value)
     verify_config(tomllib.loads(config), key, auth_store)
+    atomic(path, config)
+    # Preserve all existing login bytes, including credentials that cannot be checked offline.
+    # Only a pristine file-based environment receives a native API-key auth file.
+    if not auth_value and auth_store == 'file' and previous.get('forced_login_method') != 'chatgpt':
+        atomic(auth_path, json.dumps({'OPENAI_API_KEY': key}, indent=2) + '\n')
+        LOG.info('AUTH_FILE_CREATED mode=apiKey')
+    else:
+        LOG.info('AUTH_PRESERVED store=%s runtime_validation=skipped', auth_store)
+    verify_config(tomllib.loads(path.read_text(encoding='utf-8')), key, auth_store)
     settings_config = json.dumps({'auth': {'OPENAI_API_KEY': key}, 'config': config}, ensure_ascii=False)
     # An unbound official card follows the live ChatGPT login. CC Switch backfills it on switch-away.
     # Preserve an existing official API key explicitly; never place the KAIZO key on the official card.
-    personal_auth = auth_value if official_route and account['type'] == 'apiKey' and auth_value.get('OPENAI_API_KEY') not in (None, '', key) else {}
+    personal_auth = auth_value if official_route and auth_value.get('auth_mode') in (None, 'apikey') and not auth_value.get('tokens') and auth_value.get('OPENAI_API_KEY') not in (None, '', key) else {}
     personal_config = original_config if official_route else f'model_provider = "openai"\ncli_auth_credentials_store = "{auth_store}"\n'
     personal_settings = json.dumps({'auth': personal_auth, 'config': personal_config}, ensure_ascii=False)
     with sqlite3.connect(cc / 'cc-switch.db') as db:
@@ -605,7 +563,7 @@ def configure(binary, work, codex, cc, key, agents):
         saved = db.execute("SELECT settings_config FROM providers WHERE id=? AND app_type='codex' AND is_current=1", (PROVIDER,)).fetchone()
     if not saved or saved[0] != settings_config:
         raise Failure('CC Switch 供应商回读不一致。')
-    return auth_store, account
+    return auth_store
 
 
 def read_encoded(path):
@@ -780,16 +738,8 @@ def proxy_preflight(home, codex, backup, detail):
 
 def applications():
     raw = ps(r"""
-    $kaizoApps=@()
-    foreach($p in @(Get-AppxPackage | Where-Object { $_.Name -in @('OpenAI.Codex','OpenAI.ChatGPT') })) {
-        $m=Get-AppxPackageManifest -Package $p.PackageFullName
-        foreach($a in @($m.Package.Applications.Application)) {
-            $exe=Join-Path $p.InstallLocation ([string]$a.Executable)
-            if(-not (Test-Path -LiteralPath $exe)){continue}
-            $engines=@(Get-ChildItem -LiteralPath $p.InstallLocation -Filter 'codex.exe' -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match '\\resources\\' })
-            if($engines.Count -gt 0){$kaizoApps+=@{app=$exe;binary=$engines[0].FullName;aumid=($p.PackageFamilyName+'!'+$a.Id);version=[string]$p.Version}}
-        }
-    }
+    $kaizoApps=@(Get-AppxPackage | Where-Object { $_.Name -in @('OpenAI.Codex','OpenAI.ChatGPT') } |
+        ForEach-Object { @{name=$_.Name;package=$_.PackageFullName;version=[string]$_.Version} })
     ConvertTo-Json -InputObject @($kaizoApps) -Compress
     """)
     return json.loads(raw or '[]')
@@ -823,7 +773,7 @@ def prepare_codex(work, arch, repair, detail):
     if installed:
         return installed[0]
     if repair:
-        raise Failure('未找到包含 Codex 运行组件的桌面应用；请运行 Setup.cmd。')
+        raise Failure('未找到已注册的 Codex 桌面应用；请运行 Setup.cmd。')
     winget = shutil.which('winget.exe')
     if winget:
         try:
@@ -841,7 +791,7 @@ def prepare_codex(work, arch, repair, detail):
     ps('Add-AppxPackage -Path $kaizoData.path', {'path': str(package)}, timeout=600)
     installed = applications()
     if not installed:
-        raise Failure('安装后未发现 Codex 运行组件。请确认系统兼容性及应用安装状态。')
+        raise Failure('安装后未发现已注册的 Codex 桌面应用。请确认系统兼容性及应用安装状态。')
     return installed[0]
 
 
@@ -938,73 +888,6 @@ def initialize_cc(app, cc, backup, detail):
     atomic(settings_path, json.dumps(settings, ensure_ascii=False, indent=2))
 
 
-def error_detail(event):
-    raw = str(event.get('message', '')) + ' ' + str((event.get('error') or {}).get('message', '') if isinstance(event.get('error'), dict) else '')
-    status = re.search(r'\b(?:HTTP(?:/\d(?:\.\d)?)?(?:\s+status)?|status(?:\s+code)?)\s*[:=(]?\s*([45]\d{2})\b', raw, re.I)
-    if status:
-        return 'HTTP ' + status[1]
-    for pattern, text in [(r'localhost|127\.0\.0\.1|\[::1\]', '本地代理端口连接失败'),
-                          (r'certificate|tls|ssl', 'TLS / 证书验证失败'),
-                          (r'timeout|timed?\s*out', '请求或连接超时'),
-                          (r'dns|resolve', '域名解析失败'),
-                          (r'windows.*sandbox|sandbox.*windows', 'Windows 沙箱尚未就绪'),
-                          (r'stream.*disconnect', '响应流中断'),
-                          (r'connect|error sending request', '请求发送失败')]:
-        if re.search(pattern, raw, re.I):
-            return text
-    return '模型请求尚未完成，请检查网络或服务状态'
-
-
-def smoke_test(binary, work, detail, timeout=180):
-    command = list(binary) if isinstance(binary, (list, tuple)) else [str(binary)]
-    args = command + ['exec', '--ephemeral', '--skip-git-repo-check', '--sandbox', 'read-only',
-            '-C', str(work), '--json', 'Connectivity test only. Do not use tools, read files, or execute commands. Reply exactly KAIZO_READY.']
-    proc = start_process(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding='utf-8', errors='replace', creationflags=0x08000000 if os.name == 'nt' else 0)
-    events = queue.Queue()
-
-    def read():
-        for line in proc.stdout:
-            try:
-                events.put(json.loads(line))
-            except json.JSONDecodeError:
-                pass
-        events.put(None)
-
-    threading.Thread(target=read, daemon=True).start()
-    threading.Thread(target=lambda: proc.stderr.read(), daemon=True).start()
-    completed = failed = False
-    replies = []
-    latest = '等待 Codex 开始请求'
-    deadline = time.monotonic() + timeout
-    detail(latest)
-    try:
-        while True:
-            try:
-                event = events.get(timeout=max(0, deadline-time.monotonic()))
-            except queue.Empty:
-                raise Failure(f'模型验证超时；最后状态：{latest}。') from None
-            if event is None:
-                break
-            kind = event.get('type')
-            if kind == 'turn.started':
-                latest = '请求已开始，等待 KAIZO 返回模型回复'
-            elif kind in ('error', 'turn.failed'):
-                latest = error_detail(event)
-                failed |= kind == 'turn.failed'
-            elif kind == 'item.completed' and event.get('item', {}).get('type') == 'agent_message':
-                replies.append(event['item'].get('text', ''))
-                latest = '已收到回复，正在校验完成状态'
-            elif kind == 'turn.completed':
-                completed = True
-            detail(latest)
-        proc.wait(timeout=5)
-        if proc.returncode != 0 or failed or not completed or not replies or replies[-1].strip() != 'KAIZO_READY':
-            raise Failure('模型验证未通过；最后状态：' + latest)
-    finally:
-        stop_child(proc)
-
-
 def paths_and_checks():
     if os.name != 'nt' or sys.getwindowsversion().major < 10:
         raise Failure('请在 Windows 10 / 11 的原生 Windows 环境运行。')
@@ -1032,23 +915,6 @@ def paths_and_checks():
             raise Failure('CC Switch 与 Codex 的配置目录不一致。')
     arch = 'arm64' if 'ARM64' in (os.environ.get('PROCESSOR_ARCHITEW6432', '') + os.environ.get('PROCESSOR_ARCHITECTURE', '')).upper() else 'x64'
     return home, codex, cc, arch
-
-
-def launch_apps(app, cc_app, detail):
-    # Directly launch the registered package executable from the cleaned environment.
-    options = {'stdin': subprocess.DEVNULL, 'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL,
-               'creationflags': 0x00000008 | 0x00000200}
-    start_process([app['app']], cwd=str(Path(app['app']).parent), **options)
-    deadline = time.monotonic() + 20
-    expected = os.path.normcase(app['app'])
-    while time.monotonic() < deadline:
-        if any(os.path.normcase(item.get('Path') or '') == expected for item in processes()):
-            break
-        time.sleep(1)
-    else:
-        raise Failure('配置和模型验证通过，但未确认桌面应用启动；请从开始菜单打开。')
-    start_process([cc_app], **options)
-    detail('已启动 ChatGPT / Codex 和 CC Switch')
 
 
 def restore_mode(home, codex, cc):
@@ -1093,7 +959,7 @@ def main(mode):
     agents = (ROOT / 'AGENTS.md').read_text(encoding='utf-8-sig')
     print('\nKAIZO / Windows 配置\nGPT-6 Astra · Medium · Fast OFF\n' + BASE)
     print('将备份配置，处理确认失效的代理，保留个人登录并添加 KAIZO，写入通用工作规范。')
-    print('验证会发送一次简短模型请求，消耗少量 API 额度。请先保存工作并退出相关应用。')
+    print('本次只写入并核对配置，不启动 Codex、不发送模型请求。请先保存工作并退出相关应用。')
     input('按 Enter 开始，或 Ctrl+C 退出：')
     ui = Dashboard()
     backup = None
@@ -1112,7 +978,7 @@ def main(mode):
                     backup.capture(codex / name)
                 proxy_preflight(home, codex, backup, lambda text: ui.detail(0, text))
             with ui.step(1, '已安装则复用；缺失时安装官方 Windows 应用'):
-                app = prepare_codex(work, arch, mode == 'repair', lambda text: ui.detail(1, text))
+                prepare_codex(work, arch, mode == 'repair', lambda text: ui.detail(1, text))
             with ui.step(2, '检查 CC Switch 版本与配置数据库'):
                 cc_app = prepare_cc(arch, mode == 'repair', lambda text: ui.detail(2, text))
                 if mode == 'repair':
@@ -1127,23 +993,23 @@ def main(mode):
                 backup.capture(cc / 'settings.json')
                 backup.capture(cc / 'cc-switch.db', database=True)
             with ui.step(4, '保留已有账户；添加 KAIZO 与个人账户切换入口'):
-                auth_store, account = configure(app['binary'], work, codex, cc, key, agents)
-            with ui.step(5, '用新的验证进程核对登录状态和生效配置'):
-                with Rpc(app['binary'], work) as rpc:
-                    verify_config(rpc.call('config/read', {'includeLayers': False})['config'], key, auth_store)
-                    verify_account(rpc, account)
-                smoke_test(app['binary'], work, lambda text: ui.detail(5, text))
+                auth_store = configure(codex, cc, key, agents)
+            with ui.step(5, '读取本地 TOML、供应商记录与工作规范；不启动 Codex'):
+                verify_config(tomllib.loads((codex / 'config.toml').read_text(encoding='utf-8')), key, auth_store)
+                check_db(cc / 'cc-switch.db')
+                if (codex / 'AGENTS.md').read_text(encoding='utf-8') != agents:
+                    raise Failure('工作规范回读不一致。')
+            with ui.step(6, '配置已保存，请稍后手动打开应用'):
+                LOG.info('CONFIGURATION_COMPLETE runtime_validation=skipped application_launch=skipped')
             validated = True
-            with ui.step(6, '启动应用供新建本地任务使用'):
-                launch_apps(app, cc_app, lambda text: ui.detail(6, text))
         ui.stop()
-        print('\n✓ 登录状态、模型配置和实际回复验证通过，应用已启动。')
+        print('\n✓ 配置已写入并回读确认；未进行联网验证。')
         print('GPT-6 Astra · Medium · Fast OFF · 通用 AGENTS.md')
-        print('请新建 Windows 本地 Codex 任务；已有任务可能保留旧设置。')
+        print('请手动打开 Codex，新建 Windows 本地任务；已有任务可能保留旧设置。')
         print('以后在 CC Switch 的 Codex 页面切换「我的 ChatGPT 账户」与「KAIZO · Astra / Medium」。')
         print('切换前保存工作并退出 Codex，切换后重新打开；尚未登录个人账户时，首次切回需要登录。')
         print('备份：' + str(backup.directory))
-        LOG.info('RUN_DONE result=success')
+        LOG.info('RUN_DONE result=configured_only')
         if LOG_PATH:
             print('完整日志：' + str(LOG_PATH))
     except BaseException as error:

@@ -195,73 +195,35 @@ def check_public_setup(setup, root):
                 install.assert_not_called()
 
 
-def fake(state_path, mode):
-    state = json.loads(Path(state_path).read_text())
-    directory = Path(state['directory'])
-    if mode == 'exec':
-        if state.get('hang'):
-            time.sleep(60)
-        for event in state['events']:
-            print(json.dumps(event), flush=True)
-        return
-    cached_account = state.get('native_account')
-    if not cached_account and (directory / 'auth.json').exists():
-        auth = json.loads((directory / 'auth.json').read_text())
-        if auth.get('auth_mode') == 'chatgpt' or auth.get('tokens'):
-            cached_account = {'type': 'chatgpt', 'email': 'fixture@example.invalid', 'planType': 'plus'}
-        elif auth.get('OPENAI_API_KEY'):
-            cached_account = {'type': 'apiKey'}
-    if state.get('hide_account'):
-        cached_account = None
-    for line in sys.stdin:
-        request = json.loads(line)
-        if 'id' not in request:
-            continue
-        method, params = request['method'], request.get('params', {})
-        result = {}
-        if method == 'config/read':
-            import tomllib
-            config_path = directory / 'config.toml'
-            config = tomllib.loads(config_path.read_text()) if config_path.exists() else {}
-            result = {'config': config, 'layers': [{'name': {'type': 'user', 'file': str(config_path)}}]}
-        elif method == 'config/batchWrite':
-            lines, tables = ['# existing unrelated setting', 'sandbox_mode = "read-only"'], []
-            for edit in params['edits']:
-                name, value = edit['keyPath'], edit['value']
-                if value is None:
-                    continue
-                if isinstance(value, dict):
-                    tables.append('[' + name + ']\n' + '\n'.join(k + ' = ' + json.dumps(v) for k, v in value.items()))
-                else:
-                    lines.append(name + ' = ' + json.dumps(value))
-            Path(params['filePath']).write_text('\n'.join(lines + tables) + '\n')
-            result = {'status': 'ok'}
-        elif method == 'account/login/start':
-            with (directory / 'login-calls.log').open('a') as file:
-                file.write('apiKey login\n')
-            if state.get('forbid_login'):
-                print(json.dumps({'id': request['id'], 'error': {'code': -1}}), flush=True)
-                continue
-            (directory / 'auth.json').write_text(json.dumps({'OPENAI_API_KEY': params['apiKey']}))
-            cached_account = {'type': 'apiKey'}
-            result = {'type': 'apiKey'}
-        elif method == 'account/read':
-            result = {'account': cached_account, 'requiresOpenaiAuth': True}
-        print(json.dumps({'id': request['id'], 'result': result}), flush=True)
+def check_no_codex_start(setup, root, codex, cc, key):
+    blocked = r'C:\Program Files\WindowsApps\OpenAI.Codex_26.901.6511.0_x64__2p2nqsd0c76g0\app\resources\codex.exe'
+    denied = PermissionError(13, 'Access is denied', blocked)
+    denied.winerror = 5
+    output = io.StringIO()
+    with patch.object(setup, 'paths_and_checks', return_value=(root, codex, cc, 'x64')), \
+         patch.object(setup, 'load_provider', return_value=key), patch.object(setup, 'private'), \
+         patch.object(setup, 'wait_closed'), patch.object(setup, 'proxy_preflight'), \
+         patch.object(setup, 'prepare_codex', return_value={'app': blocked, 'binary': blocked}), \
+         patch.object(setup, 'prepare_cc', return_value='fixture-cc.exe'), \
+         patch.object(setup, 'processes', return_value=[]), patch.object(setup, 'init_log'), \
+         patch('builtins.input', return_value=''), patch.object(setup, 'start_process', side_effect=denied) as launch, \
+         contextlib.redirect_stdout(output):
+        setup.main('repair')
+        launch.assert_not_called()
+    setup.verify_config(setup.tomllib.loads((codex / 'config.toml').read_text()), key)
+    assert '未进行联网验证' in output.getvalue()
 
 
 def check():
     spec = importlib.util.spec_from_file_location('kaizo_setup', Path(__file__).with_name('setup.py'))
     setup = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(setup)
-    # All credentials in this check are fictional, never loaded from provider.json.
     dummy_key = 'sk-offline-fixture-key-never-sent'
     stale = 'http://srt:offline@localhost:64321'
     fresh = 'http://srt:other@localhost:54321'
-    original_profile = '$env:HTTP_PROXY = "' + stale + '"\nWrite-Output "keep"\n'
-    profile = setup.profile_cleanup(original_profile, {stale})
-    assert profile.startswith(original_profile)
-    assert setup.profile_cleanup(profile, {stale}) == profile
+    profile_before = '$env:HTTP_PROXY = "' + stale + '"\nWrite-Output "keep"\n'
+    profile = setup.profile_cleanup(profile_before, {stale})
+    assert profile.startswith(profile_before) and setup.profile_cleanup(profile, {stale}) == profile
     assert '-ccontains' in profile and fresh not in profile
     dotenv = 'KEEP=value\nexport HTTP_PROXY="' + stale + '" # old\nhttps_proxy=' + fresh + '\n'
     cleaned = setup.dotenv_cleanup(dotenv, {stale})
@@ -272,19 +234,16 @@ def check():
         assert not setup.is_dead(stale)
     assert setup.proxy_url('http://[::1]:1234') == ('::1', 1234)
     assert setup.proxy_url('http://localhost:invalid') is None
-
     with tempfile.TemporaryDirectory(prefix='kaizo-offline-check-') as temporary, contextlib.ExitStack() as cleanup:
         root = Path(temporary).resolve()
         cleanup.callback(setup.close_log)
         log_path = check_logging(setup, root)
         check_public_setup(setup, root)
         codex, cc = root / 'fake-codex', root / 'fake-cc'
-        codex.mkdir()
-        cc.mkdir()
+        codex.mkdir(); cc.mkdir()
         db_path = cc / 'cc-switch.db'
-        # Required DDL from CC Switch 3.20.2 source; extra provider data must survive.
         with sqlite3.connect(db_path) as db:
-            db.executescript('''
+            db.executescript("""
             PRAGMA user_version=18;
             CREATE TABLE providers(id TEXT NOT NULL,app_type TEXT NOT NULL,name TEXT NOT NULL,
                 settings_config TEXT NOT NULL,website_url TEXT,category TEXT,created_at INTEGER,
@@ -300,120 +259,71 @@ def check():
             INSERT INTO providers(id,app_type,name,settings_config,is_current)
                 VALUES('other','claude','Unrelated','{}',1),('old','codex','Old','{}',1);
             INSERT INTO prompts(id,app_type,name,content) VALUES('old','codex','Old','Old persona');
-            ''')
+            """)
         db.close()
-        (codex / 'config.toml').write_text('model = "old"\n')
-        (codex / 'AGENTS.md').write_text('Old persona')
+        original = '# keep in backup\nmodel = "old"\nsandbox_mode = "read-only"\n[features]\nkeep_feature = true\n'
+        (codex / 'config.toml').write_text(original)
+        (codex / 'AGENTS.md').write_text('Old guidelines')
         (codex / 'AGENTS.override.md').write_text('Old override')
         (cc / 'settings.json').write_text('{"unrelated": "keep"}')
-        originals = {path: path.read_bytes() for path in (codex / 'config.toml', codex / 'AGENTS.md',
-                    codex / 'AGENTS.override.md', cc / 'settings.json')}
+        originals = {path: path.read_bytes() for path in (codex / 'config.toml', codex / 'AGENTS.md', codex / 'AGENTS.override.md', cc / 'settings.json')}
         backup = setup.Backup(root / 'backup')
         for path in (*originals, codex / 'auth.json'):
             backup.capture(path)
         backup.capture(db_path, database=True)
-        state_path = root / 'fake-state.json'
-        state = {'directory': str(codex), 'events': [
-            {'type': 'turn.started'},
-            {'type': 'error', 'message': 'HTTP 503'},
-            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'KAIZO_READY'}},
-            {'type': 'turn.completed'}]}
-        state_path.write_text(json.dumps(state))
-        binary = [sys.executable, '-X', 'utf8', str(Path(__file__).resolve()), '--fake', str(state_path)]
-        agents = (Path(__file__).with_name('AGENTS.md')).read_text()
+        agents = Path(__file__).with_name('AGENTS.md').read_text()
         assert all(word not in agents for word in ('N.O.V.A.', 'Dylan', 'Sir', '女性', 'female'))
-        setup.check_db(db_path)
-        with setup.Rpc(binary, root) as rpc:
-            try:
-                setup.verify_account(rpc)
-                raise AssertionError('missing API login accepted')
-            except setup.Failure:
-                pass
-        for _ in range(2):
-            setup.configure(binary, root, codex, cc, dummy_key, agents)
-            with setup.Rpc(binary, root) as rpc:
-                config = rpc.call('config/read', {'includeLayers': False})['config']
+        # Drive main through all steps with an inaccessible WindowsApps binary and forbid all launches.
+        check_no_codex_start(setup, root, codex, cc, dummy_key)
+        backup.restore()
+        with patch.object(setup, 'start_process', side_effect=AssertionError('configuration started a process')), patch.object(setup, 'private'):
+            for _ in range(2):
+                assert setup.configure(codex, cc, dummy_key, agents) == 'file'
+                config = setup.tomllib.loads((codex / 'config.toml').read_text())
                 setup.verify_config(config, dummy_key)
-                setup.verify_account(rpc)
-            assert config['sandbox_mode'] == 'read-only'
-            assert not (codex / 'AGENTS.override.md').exists()
-            assert (codex / 'AGENTS.md').read_text() == agents
-            settings = json.loads((cc / 'settings.json').read_text())
-            assert settings['preserveCodexOfficialAuthOnSwitch'] is True and settings['unrelated'] == 'keep'
-            with sqlite3.connect(db_path) as db:
-                saved = db.execute("SELECT settings_config FROM providers WHERE app_type='codex' AND is_current=1").fetchall()
-                assert len(saved) == 1 and json.loads(saved[0][0])['auth']['OPENAI_API_KEY'] == dummy_key
-                assert json.loads(saved[0][0])['config'] == (codex / 'config.toml').read_text()
-                assert db.execute("SELECT is_current FROM providers WHERE app_type='claude'").fetchone() == (1,)
-                assert db.execute("SELECT content FROM prompts WHERE app_type='codex' AND enabled=1").fetchall() == [(agents,)]
-            db.close()
-        assert (codex / 'login-calls.log').read_text().splitlines() == ['apiKey login']
-        with sqlite3.connect(db_path) as db:
-            personal = json.loads(db.execute("SELECT settings_config FROM providers WHERE id=?", (setup.PERSONAL_PROVIDER,)).fetchone()[0])
-        db.close()
-        assert personal['auth'] == {} and dummy_key not in json.dumps(personal)
+                assert config['sandbox_mode'] == 'read-only' and config['features']['keep_feature'] is True
+                assert not (codex / 'AGENTS.override.md').exists()
+                assert (codex / 'AGENTS.md').read_text() == agents
+                assert json.loads((codex / 'auth.json').read_text()) == {'OPENAI_API_KEY': dummy_key}
+                settings = json.loads((cc / 'settings.json').read_text())
+                assert settings['preserveCodexOfficialAuthOnSwitch'] is True and settings['unrelated'] == 'keep'
+                with sqlite3.connect(db_path) as db:
+                    saved = db.execute("SELECT settings_config FROM providers WHERE app_type='codex' AND is_current=1").fetchall()
+                    assert len(saved) == 1 and json.loads(saved[0][0])['auth']['OPENAI_API_KEY'] == dummy_key
+                    assert json.loads(saved[0][0])['config'] == (codex / 'config.toml').read_text()
+                    assert db.execute("SELECT is_current FROM providers WHERE app_type='claude'").fetchone() == (1,)
+                    assert db.execute("SELECT content FROM prompts WHERE app_type='codex' AND enabled=1").fetchall() == [(agents,)]
+                db.close()
         config['service_tier'] = 'fast'
         try:
             setup.verify_config(config, dummy_key)
             raise AssertionError('Fast override accepted')
         except setup.Failure:
             pass
-        messages = []
-        setup.smoke_test(binary, root, messages.append, timeout=8)
-        assert dummy_key not in '\n'.join(messages)
-        assert setup.error_detail({'message': 'HTTP 401 Bearer ' + dummy_key}) == 'HTTP 401'
-        for events in ([{'type': 'turn.completed'}],
-                       [{'type': 'item.completed', 'item': {'type': 'command_execution', 'text': 'KAIZO_READY'}}, {'type': 'turn.completed'}],
-                       state['events'] + [{'type': 'turn.failed', 'error': {'message': 'HTTP 401'}}]):
-            state_path.write_text(json.dumps({**state, 'events': events}))
-            try:
-                setup.smoke_test(binary, root, messages.append, timeout=8)
-                raise AssertionError('invalid model completion accepted')
-            except setup.Failure:
-                pass
-        state_path.write_text(json.dumps({**state, 'hang': True}))
-        started = time.monotonic()
-        try:
-            setup.smoke_test(binary, root, messages.append, timeout=0.5)
-            raise AssertionError('hanging child accepted')
-        except setup.Failure:
-            assert time.monotonic() - started < 12
         with sqlite3.connect(db_path) as db:
             db.execute("UPDATE proxy_config SET enabled=1 WHERE app_type='codex'")
         db.close()
         try:
             setup.check_db(db_path)
-            raise AssertionError('local takeover accepted')
+            raise AssertionError('proxy takeover accepted')
         except setup.Failure:
             pass
         backup.restore()
         assert all(path.read_bytes() == value for path, value in originals.items())
         assert not (codex / 'auth.json').exists()
-        with sqlite3.connect(db_path) as db:
-            assert db.execute("SELECT id FROM providers WHERE app_type='codex'").fetchall() == [('old',)]
-        db.close()
-        setup.check_db(db_path)
-
-        # Existing ChatGPT logins remain native, including Windows credential-store modes.
-        oauth = {'auth_mode': 'chatgpt', 'tokens': {'id_token': 'fixture-id',
-                 'access_token': 'personal-access-token', 'refresh_token': 'personal-refresh-token', 'account_id': 'fixture-account'}}
+        oauth = {'auth_mode': 'chatgpt', 'tokens': {'id_token': 'fixture-id', 'access_token': 'personal-access-token', 'refresh_token': 'personal-refresh-token'}}
+        # Existing file credentials remain byte-for-byte intact; keyring/auto are never probed or overwritten.
         for store in ('file', 'keyring', 'auto'):
             backup.restore()
-            (codex / 'login-calls.log').unlink(missing_ok=True)
             personal_config = '# personal settings\nmodel_provider = "openai"\nmodel = "my-chosen-model"\ncli_auth_credentials_store = "' + store + '"\n'
             (codex / 'config.toml').write_text(personal_config)
-            auth_before = json.dumps(oauth).encode() if store == 'file' else None
-            if auth_before:
-                (codex / 'auth.json').write_bytes(auth_before)
-            state_personal = {**state, 'forbid_login': True}
-            if store != 'file':
-                state_personal['native_account'] = {'type': 'chatgpt', 'email': 'fixture@example.invalid', 'planType': 'plus'}
-            state_path.write_text(json.dumps(state_personal))
+            before = json.dumps(oauth, indent=4).encode() if store == 'file' else None
+            if before:
+                (codex / 'auth.json').write_bytes(before)
             for _ in range(2):
-                actual_store, expected = setup.configure(binary, root, codex, cc, dummy_key, agents)
-                assert actual_store == store and expected['type'] == 'chatgpt'
-                assert not (codex / 'login-calls.log').exists()
-                assert ((codex / 'auth.json').read_bytes() if (codex / 'auth.json').exists() else None) == auth_before
+                with patch.object(setup, 'private'), patch.object(setup, 'start_process', side_effect=AssertionError('offline account preservation started a process')):
+                    assert setup.configure(codex, cc, dummy_key, agents) == store
+                assert ((codex / 'auth.json').read_bytes() if (codex / 'auth.json').exists() else None) == before
                 with sqlite3.connect(db_path) as db:
                     rows = db.execute("SELECT id,category,settings_config FROM providers WHERE id IN (?,?)", (setup.PERSONAL_PROVIDER, setup.PROVIDER)).fetchall()
                 db.close()
@@ -421,84 +331,79 @@ def check():
                 assert cards[setup.PERSONAL_PROVIDER] == ('official', {'auth': {}, 'config': personal_config})
                 assert cards[setup.PROVIDER][1]['auth'] == {'OPENAI_API_KEY': dummy_key}
                 assert 'personal-refresh-token' not in json.dumps(cards[setup.PROVIDER])
-            # Project the two stored cards into this fixture using CC Switch's config-only contract.
-            # This validates the records and fresh process reads, not the real CC Switch GUI.
             for selected in (setup.PERSONAL_PROVIDER, setup.PROVIDER, setup.PERSONAL_PROVIDER):
-                (codex / 'config.toml').write_text(cards[selected][1]['config'])
-                with setup.Rpc(binary, root) as rpc:
-                    current = rpc.call('config/read', {'includeLayers': False})['config']
-                    setup.verify_account(rpc, expected)
+                selected_config = cards[selected][1]['config']
+                (codex / 'config.toml').write_text(selected_config)
+                current = setup.tomllib.loads((codex / 'config.toml').read_text())
                 if selected == setup.PERSONAL_PROVIDER:
                     assert current['model_provider'] == 'openai' and current['model'] == 'my-chosen-model'
-                    assert dummy_key not in cards[selected][1]['config']
+                    assert dummy_key not in selected_config
                 else:
                     setup.verify_config(current, dummy_key, store)
-                assert ((codex / 'auth.json').read_bytes() if (codex / 'auth.json').exists() else None) == auth_before
-
-        # A personal official API key is preserved separately from the KAIZO key.
+                assert ((codex / 'auth.json').read_bytes() if (codex / 'auth.json').exists() else None) == before
         backup.restore()
-        (codex / 'config.toml').write_text('model_provider = "openai"\n')
         personal_key = 'sk-fictional-personal-official-key'
         (codex / 'auth.json').write_text(json.dumps({'OPENAI_API_KEY': personal_key}))
-        state_path.write_text(json.dumps({**state, 'forbid_login': True}))
-        setup.configure(binary, root, codex, cc, dummy_key, agents)
-        assert json.loads((codex / 'auth.json').read_text())['OPENAI_API_KEY'] == personal_key
+        before = (codex / 'auth.json').read_bytes()
+        setup.configure(codex, cc, dummy_key, agents)
+        assert (codex / 'auth.json').read_bytes() == before
         with sqlite3.connect(db_path) as db:
             personal = json.loads(db.execute("SELECT settings_config FROM providers WHERE id=?", (setup.PERSONAL_PROVIDER,)).fetchone()[0])
         db.close()
         assert personal['auth']['OPENAI_API_KEY'] == personal_key and dummy_key not in json.dumps(personal)
-
-        # An unreadable existing login must stop without trying API-key login.
         backup.restore()
-        (codex / 'login-calls.log').unlink(missing_ok=True)
-        (codex / 'auth.json').write_text(json.dumps(oauth))
-        protected = (codex / 'auth.json').read_bytes()
-        state_path.write_text(json.dumps({**state, 'forbid_login': True, 'hide_account': True}))
+        (codex / 'config.toml').write_text('forced_login_method = "chatgpt"\n')
+        setup.configure(codex, cc, dummy_key, agents)
+        assert not (codex / 'auth.json').exists()
+        assert setup.tomllib.loads((codex / 'config.toml').read_text())['forced_login_method'] == 'chatgpt'
+        backup.restore()
+        (codex / 'auth.json').write_text('{invalid json')
         try:
-            setup.configure(binary, root, codex, cc, dummy_key, agents)
-            raise AssertionError('unreadable personal credentials replaced')
+            setup.configure(codex, cc, dummy_key, agents)
+            raise AssertionError('invalid auth overwritten')
+        except json.JSONDecodeError:
+            assert (codex / 'config.toml').read_text() == original
+            assert (codex / 'auth.json').read_text() == '{invalid json'
+        backup.restore()
+        with sqlite3.connect(db_path) as db:
+            db.execute("INSERT INTO providers(id,app_type,name,settings_config,category) VALUES(?,'codex','Existing','{}','third_party')", (setup.PERSONAL_PROVIDER,))
+        db.close()
+        try:
+            setup.configure(codex, cc, dummy_key, agents)
+            raise AssertionError('conflicting provider overwritten')
         except setup.Failure:
-            assert (codex / 'auth.json').read_bytes() == protected
-            assert not (codex / 'login-calls.log').exists()
+            assert (codex / 'config.toml').read_text() == original
+        values = {'name.with.dots': '中文\nquoted "text"\t', 'switch': True, 'integer': 9, 'fraction': 1.5,
+                  'date': setup.datetime.date(2026, 9, 9), 'time': setup.datetime.time(12, 34, 56),
+                  'datetime': setup.datetime.datetime(2026, 9, 9, 12, 34, tzinfo=setup.datetime.timezone.utc),
+                  'nested': {'quoted.key': {'empty': {}, 'mixed': [1, 'two', {'nested': [True, False]}]}},
+                  'mcp_servers': {'fixture': {'command': 'fixture', 'args': ['--keep', r'C:\path with spaces\tool.exe']}}}
+        assert setup.tomllib.loads(setup.toml_text(values)) == values
         refresh_backup = setup.Backup(root / 'refresh-backup')
+        (codex / 'auth.json').write_text(json.dumps(oauth))
         refresh_backup.capture(codex / 'auth.json')
-        rotated = json.dumps({**oauth, 'tokens': {**oauth['tokens'], 'refresh_token': 'rotated-fixture-token'}}).encode()
+        rotated = json.dumps({**oauth, 'tokens': {'refresh_token': 'rotated-fixture-token'}}).encode()
         (codex / 'auth.json').write_bytes(rotated)
         refresh_backup.restore(preserve_personal_auth=True)
         assert (codex / 'auth.json').read_bytes() == rotated
         refresh_backup.restore()
-        assert (codex / 'auth.json').read_bytes() == protected
-        with sqlite3.connect(db_path) as db:
-            db.execute("INSERT INTO providers(id,app_type,name,settings_config,category) VALUES(?,'codex','Existing','{}','third_party')", (setup.PERSONAL_PROVIDER,))
-        db.close()
-        state_path.write_text(json.dumps({**state, 'forbid_login': True}))
-        try:
-            setup.configure(binary, root, codex, cc, dummy_key, agents)
-            raise AssertionError('colliding provider ID overwritten')
-        except setup.Failure as error:
-            assert 'ID' in str(error)
-        with sqlite3.connect(db_path) as db:
-            assert db.execute("SELECT settings_config,category FROM providers WHERE id=?", (setup.PERSONAL_PROVIDER,)).fetchone() == ('{}', 'third_party')
-        db.close()
+        assert json.loads((codex / 'auth.json').read_text()) == oauth
         check_windows_permissions(setup, root)
         setup.close_log()
         logs = log_path.read_text(encoding='utf-8')
         for expected in ('bootstrap fixture', 'RUN_START', 'STEP_START', 'STEP_DONE', 'STEP_FAILED', 'elapsed=',
-                         'RPC_START', 'RPC_DONE', 'PROCESS_EXIT', 'PROCESS_DENIED', 'code=7', '0x80070005',
-                         'WRITE_BEGIN', 'locked-config.toml', 'WinError 32', 'WinError 5', 'REGISTRY_OPEN',
-                         'ROLLBACK_START', 'ROLLBACK_DONE', '[KEY]', '[TOKEN]', '[CREDENTIALS]'):
+                         'PROCESS_EXIT', 'PROCESS_DENIED', 'code=7', '0x80070005', 'WRITE_BEGIN', 'locked-config.toml',
+                         'WinError 32', 'WinError 5', 'REGISTRY_OPEN', 'ROLLBACK_START', 'ROLLBACK_DONE',
+                         'CONFIGURATION_COMPLETE runtime_validation=skipped application_launch=skipped', '[KEY]', '[TOKEN]', '[CREDENTIALS]'):
             assert expected in logs, 'missing diagnostic: ' + expected
         for secret in (dummy_key, stale, 'fixture-secret-key', 'fixture-proxy-password', 'fixture-bearer-token',
                        'fixture-refresh-token', 'fixture-apikey-value', 'fixture-process-output', 'sk-process-secret',
-                       'sk-never-log-file-contents', 'rotated-fixture-token', 'fixture@example.invalid'):
-            assert secret not in logs, 'sensitive data in logs: ' + secret
-        assert 'sk-public-input-fixture-never-sent' not in logs
-    print('PASS: hidden key input/cache, verified dependency download, persistent redacted logs, permission fallback, account/provider switching, proxy cleanup, timeouts and rollback.')
-    print('No installed Codex/CC Switch, real credentials or network requests were used.')
+                       'sk-never-log-file-contents', 'rotated-fixture-token', 'personal-refresh-token',
+                       'sk-public-input-fixture-never-sent'):
+            assert secret not in logs, 'sensitive data in logs'
+    print('PASS: configuration completes with ALL application starts denied; TOML values preserved; account/provider switching, hidden key input, verified downloads, logs, proxy cleanup and rollback.')
+    print('No installed Codex/CC Switch, real credentials or model requests were used.')
 
 
 if __name__ == '__main__':
-    if len(sys.argv) > 1 and sys.argv[1] == '--fake':
-        fake(sys.argv[2], sys.argv[3])
-    else:
-        check()
+    check()
