@@ -1,6 +1,6 @@
 # KAIZO Codex Windows Setup
 
-Windows 原生 Codex / ChatGPT 桌面应用与 CC Switch 配置脚本（v2.4.0，只写配置）。默认 KAIZO、GPT-6 Astra、Medium、Fast OFF；保留个人账户，提供通用 AGENTS.md 和脱敏日志。
+Windows 原生 Codex / ChatGPT 桌面应用与 CC Switch 配置脚本（v2.4.1，只写配置）。默认 KAIZO、GPT-6 Astra、Medium、Fast OFF；保留个人账户，提供通用 AGENTS.md 和脱敏日志。
 
 ## 在 Windows 上运行
 
@@ -30,6 +30,8 @@ git pull --ff-only
 ```
 
 需要补装应用时运行 `Setup.cmd`。更新脚本本身不会切换账户；运行配置后默认启用 KAIZO，个人账户仍可从 CC Switch 切回。
+
+v2.4.1 修复 Windows v2.4.0 中 CC Switch 地址/模型栏为空的问题：使用 `model_provider`、`base_url` 和 `[model_providers.custom]` 的标准写法，避免合法但带引号的键名被界面的文本解析器漏读。关闭 Codex 和 CC Switch 后，按上面的更新步骤运行即可修正现有配置。配置字段及 Key 保持原值，继续不启动 Codex、不发送模型请求。
 
 Key 保存在 `%LOCALAPPDATA%\KAIZO-Setup\provider.json`，下载缓存保存在该目录下的 `Downloads`，均在 Git 仓库之外。后续更新或重新 clone 会复用本机 Key。需要更换 Key 时可编辑该文件；也支持 `KAIZO_API_KEY` 环境变量。旧版配置包中的 `provider.json` 可在首次运行时导入。`provider.example.json` 是空模板，不能直接当作可用凭据。
 
@@ -117,6 +119,8 @@ Key 保存在 `%LOCALAPPDATA%\KAIZO-Setup\provider.json`，下载缓存保存在
 本版完全取消 Codex 配置服务、模型请求和自动打开应用，直接解析并更新用户目录中的 `config.toml`，同步 CC Switch 数据库。Codex 的安装检测只查询 Windows 注册记录，不访问或运行 `WindowsApps` 中的 `codex.exe`。
 
 回归检查将所有应用启动设为拒绝访问，再执行完整配置流程，确认仍能完成；同时覆盖个人账户和 API Key 凭据保留、file / keyring / auto 存储、两张配置卡切换、TOML 字段值保留、重复执行、备份回滚、代理处理、隐藏输入与日志脱敏。
+
+回归检查还读取数据库中实际保存的 TOML，按 [CC Switch 3.20.2 表单的字段解析规则](https://github.com/farion1231/cc-switch/blob/v3.20.2/src/utils/providerConfigUtils.ts) 核对 API 地址、模型和协议，并覆盖 v2.4.0 格式迁移。制作端另用该版本原始解析函数复现并确认修复，未运行本机 CC Switch 应用。
 
 TOML 写入保留其他字段的值，包括 MCP 配置、数组、带点的键名及日期时间；注释和排版会重新整理，原文保存在本次备份中。脚本核对的是用户配置文件，不能离线证明组织策略、额外启动参数或已有任务的最终生效结果。
 

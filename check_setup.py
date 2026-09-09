@@ -214,6 +214,28 @@ def check_no_codex_start(setup, root, codex, cc, key):
     assert '未进行联网验证' in output.getvalue()
 
 
+def check_cc_form_fields(text, setup):
+    # CC Switch 3.20.2 providerConfigUtils.ts: the form scans bare keys and literal section names.
+    # This checks the serialized database value, separately from the TOML semantic checks.
+    lines = text.splitlines()
+    section = None
+    found = {}
+    section_pattern = setup.re.compile(r'^\s*\[([^\]\r\n]+)\]\s*$')
+    value_pattern = setup.re.compile(r'^\s*(model_provider|model|base_url|wire_api)\s*=\s*"([^"\r\n]+)"\s*$')
+    for line in lines:
+        header = section_pattern.match(line)
+        if header:
+            section = header[1]
+            continue
+        value = value_pattern.match(line)
+        if value:
+            found[(section, value[1])] = value[2]
+    assert found.get((None, 'model_provider')) == 'custom', 'CC Switch cannot identify the selected provider'
+    assert found.get((None, 'model')) == setup.MODEL, 'CC Switch model field is empty'
+    assert found.get(('model_providers.custom', 'base_url')) == setup.BASE, 'CC Switch API request address is empty'
+    assert found.get(('model_providers.custom', 'wire_api')) == 'responses'
+
+
 def check():
     spec = importlib.util.spec_from_file_location('kaizo_setup', Path(__file__).with_name('setup.py'))
     setup = importlib.util.module_from_spec(spec)
@@ -276,6 +298,11 @@ def check():
         # Drive main through all steps with an inaccessible WindowsApps binary and forbid all launches.
         check_no_codex_start(setup, root, codex, cc, dummy_key)
         backup.restore()
+        # Upgrade the quoted-key/quoted-section output produced by Windows v2.4.0.
+        (codex / 'config.toml').write_text(
+            '"model_provider" = "custom"\n"model" = "old"\n"sandbox_mode" = "read-only"\n'
+            '["features"]\n"keep_feature" = true\n'
+            '["model_providers"."custom"]\n"base_url" = "https://kaizo.top/v1"\n')
         with patch.object(setup, 'start_process', side_effect=AssertionError('configuration started a process')), patch.object(setup, 'private'):
             for _ in range(2):
                 assert setup.configure(codex, cc, dummy_key, agents) == 'file'
@@ -291,6 +318,7 @@ def check():
                     saved = db.execute("SELECT settings_config FROM providers WHERE app_type='codex' AND is_current=1").fetchall()
                     assert len(saved) == 1 and json.loads(saved[0][0])['auth']['OPENAI_API_KEY'] == dummy_key
                     assert json.loads(saved[0][0])['config'] == (codex / 'config.toml').read_text()
+                    check_cc_form_fields(json.loads(saved[0][0])['config'], setup)
                     assert db.execute("SELECT is_current FROM providers WHERE app_type='claude'").fetchone() == (1,)
                     assert db.execute("SELECT content FROM prompts WHERE app_type='codex' AND enabled=1").fetchall() == [(agents,)]
                 db.close()
@@ -401,7 +429,7 @@ def check():
                        'sk-never-log-file-contents', 'rotated-fixture-token', 'personal-refresh-token',
                        'sk-public-input-fixture-never-sent'):
             assert secret not in logs, 'sensitive data in logs'
-    print('PASS: configuration completes with ALL application starts denied; TOML values preserved; account/provider switching, hidden key input, verified downloads, logs, proxy cleanup and rollback.')
+    print('PASS: CC Switch form endpoint/model fields and v2.4.0 upgrade; configuration with ALL application starts denied; TOML values, accounts, keys, logs, proxy cleanup and rollback.')
     print('No installed Codex/CC Switch, real credentials or model requests were used.')
 
 

@@ -36,7 +36,7 @@ PROXIES = ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy'
 STEPS = ('检查 Windows 与代理', '准备 ChatGPT / Codex', '准备 CC Switch', '备份原配置',
          '配置 KAIZO 与工作规范', '核对配置文件', '完成配置')
 ROOT = Path(__file__).resolve().parent
-VERSION = '2.4.0'
+VERSION = '2.4.1'
 LOG = logging.getLogger('kaizo.setup')
 LOG.setLevel(logging.INFO)
 LOG.propagate = False
@@ -451,6 +451,10 @@ def check_db(path):
 
 def toml_text(data):
     # ponytail: stdlib TOML reader plus a value-preserving writer; backups retain comments/formatting.
+    def key(name):
+        # CC Switch's form scanners require bare standard keys and section names.
+        return name if re.fullmatch(r'[A-Za-z0-9_-]+', name) else json.dumps(name, ensure_ascii=False)
+
     def scalar(value):
         if isinstance(value, str):
             return json.dumps(value, ensure_ascii=False)
@@ -463,15 +467,15 @@ def toml_text(data):
         if isinstance(value, list):
             return '[' + ', '.join(scalar(item) for item in value) + ']'
         if isinstance(value, dict):
-            return '{' + ', '.join(json.dumps(k, ensure_ascii=False) + ' = ' + scalar(v) for k, v in value.items()) + '}'
+            return '{' + ', '.join(key(k) + ' = ' + scalar(v) for k, v in value.items()) + '}'
         raise Failure('配置含无法安全写入的 TOML 值，已停止。')
     lines = []
     def table(values, path):
         if path:
-            lines.extend(['', '[' + '.'.join(json.dumps(k, ensure_ascii=False) for k in path) + ']'])
+            lines.extend(['', '[' + '.'.join(key(k) for k in path) + ']'])
         for name, value in values.items():
             if not isinstance(value, dict):
-                lines.append(json.dumps(name, ensure_ascii=False) + ' = ' + scalar(value))
+                lines.append(key(name) + ' = ' + scalar(value))
         for name, value in values.items():
             if isinstance(value, dict):
                 table(value, path + [name])
