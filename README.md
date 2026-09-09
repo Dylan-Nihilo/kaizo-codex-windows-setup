@@ -1,6 +1,37 @@
 # KAIZO Codex Windows Setup
 
-Windows 原生 Codex / ChatGPT 桌面应用与 CC Switch 配置脚本（v2.4.1，只写配置）。默认 KAIZO、GPT-6 Astra、Medium、Fast OFF；保留个人账户，提供通用 AGENTS.md 和脱敏日志。
+Windows 原生 Codex / ChatGPT 桌面应用与 CC Switch 配置脚本（v2.5.0）。默认 KAIZO、GPT-6 Astra、Medium、Fast OFF；保留个人账户，提供通用 AGENTS.md 和脱敏日志。配置过程不启动 Codex，也不发送模型请求。
+
+## 不经过 Microsoft Store 下载安装
+
+已 clone 过本仓库时，在原目录执行：
+
+```powershell
+git pull --ff-only
+.\Install-App.cmd
+```
+
+首次使用则先执行下面的 `git clone` 和 `cd`，随后运行 `Install-App.cmd`。用日常 Windows 账户普通运行，不要以管理员身份运行。先保存工作并退出 ChatGPT/Codex。
+
+`Install-App.cmd` 自动识别 x64 / ARM64，直接下载 OpenAI 官方最新 MSIX，检查包身份，再交给 Windows 验证签名与安装。无需 Microsoft Store 的下载服务，也无需先下载 Python；有下载进度和脱敏日志。脚本只安装应用，不改 Key、CC Switch、账户文件或模型配置，也不自动打开应用。安装后需要重新应用 KAIZO 配置时，再运行 `.\Repair.cmd`；缺少 CC Switch 时用 `.\Setup.cmd`。
+
+支持未安装时安装、已有安装时按 Windows 的包更新规则处理；不强制降级或卸载。**卸载不是运行脚本的前提**。如果已自行卸载，请保留 `.codex`、`.cc-switch` 和 `%LOCALAPPDATA%\KAIZO-Setup`；脚本不能恢复卸载时已被系统清掉的应用数据或登录状态。
+
+官方直装包仍使用 Windows MSIX 安装机制，会受系统版本、依赖、权限及组织策略影响。它不是独立 MSI 或非商店 EXE；换下载渠道不能保证修复应用启动问题。[OpenAI 官方部署说明](https://learn.chatgpt.com/docs/enterprise/windows-deployment)
+
+## 应用打不开时
+
+运行 `.\Repair-App.cmd`，可选：
+
+1. 重新注册当前用户选中的现有应用，修复注册问题，不下载。
+2. 下载官方 MSIX 并安装，与 `Install-App.cmd` 相同。
+3. 只保存诊断日志，适合在刚刚手动尝试打开失败后运行。
+
+脚本记录应用包名、版本、安装路径、注册状态、已解析依赖和相关服务状态，以及近 72 小时相关 Windows 事件的编号、错误码与故障模块。每个事件通道只查最近 100 条错误/警告；无权限或没有事件会明确记录。不会保存完整事件正文、命令行、环境变量值、聊天内容或登录凭据，不会自动上传日志。
+
+该入口不重置/卸载应用、不清除缓存或配置、不改 WindowsApps 权限、不强杀进程，也不修改代理。应用仍在运行时停止操作。遇到缺文件、缺依赖、版本冲突、权限或系统策略错误时记录失败，不将其报告为修复成功。Windows 注册状态正常也不能证明窗口能打开；请手动从开始菜单打开应用验证，仍失败就重跑选项 3，再用 `Open-Logs.cmd` 找最新日志。
+
+需要系统内置修复时，在 设置 → 应用 → ChatGPT/Codex → 高级选项 中选择“修复”（若提供）。Windows 的“重置”会删除应用数据，这个脚本不执行该动作。[微软修复与重置说明](https://learn.microsoft.com/en-us/windows/msix/desktop/managing-your-msix-reset-and-repair)
 
 ## 在 Windows 上运行
 
@@ -88,6 +119,8 @@ Key 保存在 `%LOCALAPPDATA%\KAIZO-Setup\provider.json`，下载缓存保存在
 | 文件 | 用途 |
 | --- | --- |
 | `Setup.cmd` | 检查/安装应用，写入并回读配置，完成后手动打开应用 |
+| `Install-App.cmd` | 直接从 OpenAI 下载官方 MSIX 并安装应用，不经过商店下载服务 |
+| `Repair-App.cmd` | 应用启动故障诊断、重新注册或官方 MSIX 安装；不配置供应商 |
 | `Repair.cmd` | 复用已安装且兼容的应用，重新配置、检查代理并核对文件 |
 | `Restore.cmd` | 粘贴此前显示的备份目录，恢复配置与被清理的代理 |
 | `Preview.cmd` | 仅预览进度界面，不配置应用 |
@@ -105,6 +138,8 @@ Key 保存在 `%LOCALAPPDATA%\KAIZO-Setup\provider.json`，下载缓存保存在
 双击 **Open-Logs.cmd** 即可打开日志文件夹。如果该系统目录不可写，会尝试在配置包旁的 `logs` 文件夹保存，窗口会显示实际路径。失败摘要 `Last-error.txt` 放在本次备份目录；备份尚未建立时尝试放在配置包目录。回滚不会删掉运行日志。
 
 日志包含版本、Windows / PowerShell / Python 信息、每步开始与结束时间、耗时、执行程序路径与进程号、退出码、文件或注册表键路径、WinError / HRESULT、配置文件回读结果及回滚结果。失败步骤和最后一次操作会保留在文件中，不会随进度界面关闭而消失。
+
+应用安装/恢复入口也沿用相同日志目录，记录 `APP_RECOVERY_VERSION`、`APP_PACKAGE`、`APP_EVENT`、下载/安装/注册步骤与错误。它不修改用户配置，因此没有配置回滚步骤；Windows 包安装由系统处理，失败后需按日志继续诊断。
 
 不记录命令参数、配置正文、环境变量值、个人账户资料、接口请求/响应正文或子进程原始输出；记录的文本另做 Key、Bearer、账户令牌和代理密码脱敏。进度动画不会逐帧写入日志。
 
@@ -139,6 +174,8 @@ TOML 写入保留其他字段的值，包括 MCP 配置、数组、带点的键�
 ## 开发与发布
 
 `python -X utf8 check_setup.py` 在临时目录使用虚构凭据和禁止应用启动的测试回归检查；不调用真实 Codex / CC Switch 或模型 API。`scripts/check_powershell.ps1` 从当前源码提取并检查 PowerShell 语法与日志脱敏。推送会触发 Windows CI。
+
+`scripts/check_app_recovery.ps1` 在临时目录以替代的 Windows 调用检查包身份、单一目标注册、运行进程保护、缺失清单、权限错误、事件日志脱敏、MSIX 清单读取及直装成功/失败的返回值。制作端不安装或运行 Codex/CC Switch；Windows CI 验证脚本逻辑，不等同于在故障电脑上完成真实安装和启动验证。
 
 [版本记录](https://github.com/Dylan-Nihilo/kaizo-codex-windows-setup/releases)提供每版变更；日常使用 `git pull --ff-only` 更新。Python 与 CC Switch 按固定版本和校验值下载，升级时需更新 `assets/manifest.json` 并核对兼容性，不能只替换下载链接。
 

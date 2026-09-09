@@ -23,6 +23,9 @@ jobs:
       - name: PowerShell syntax and log redaction
         shell: powershell
         run: .\scripts\check_powershell.ps1
+      - name: Application recovery safety and diagnostics
+        shell: powershell
+        run: .\scripts\check_app_recovery.ps1
       - name: Fresh clone bootstrap and offline regression checks
         shell: powershell
         run: |

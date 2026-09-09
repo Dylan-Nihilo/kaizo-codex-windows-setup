@@ -36,7 +36,7 @@ PROXIES = ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy'
 STEPS = ('检查 Windows 与代理', '准备 ChatGPT / Codex', '准备 CC Switch', '备份原配置',
          '配置 KAIZO 与工作规范', '核对配置文件', '完成配置')
 ROOT = Path(__file__).resolve().parent
-VERSION = '2.4.1'
+VERSION = '2.5.0'
 LOG = logging.getLogger('kaizo.setup')
 LOG.setLevel(logging.INFO)
 LOG.propagate = False

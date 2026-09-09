@@ -1,4 +1,4 @@
-﻿param([ValidateSet('setup','repair','restore','demo','check')][string]$Mode = 'setup')
+﻿param([ValidateSet('setup','repair','restore','demo','check','app-recovery','app-install')][string]$Mode = 'setup')
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $OutputEncoding = [Console]::OutputEncoding
@@ -41,6 +41,12 @@ try {
     if (-not [Environment]::Is64BitOperatingSystem) { throw 'Windows x64 or ARM64 is required.' }
     $kaizoArch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') { 'arm64' } else { 'x64' }
     Write-SetupLog 'INFO' ('ARCH ' + $kaizoArch)
+    if ($Mode -in @('app-recovery','app-install')) {
+        $kaizoStage = 'app-recovery'
+        . (Join-Path $PSScriptRoot 'scripts\app-recovery.ps1')
+        $kaizoExit = Invoke-AppRecovery -DirectInstall:($Mode -eq 'app-install')
+        exit $kaizoExit
+    }
     $kaizoStage = 'verify-runtime'
     $kaizoManifest = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'assets\manifest.json') -Raw | ConvertFrom-Json
     $kaizoPackage = $kaizoManifest.$kaizoArch.python
