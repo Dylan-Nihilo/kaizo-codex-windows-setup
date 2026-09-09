@@ -1,0 +1,30 @@
+name: Windows checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      PYTHONUTF8: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: PowerShell syntax and log redaction
+        shell: powershell
+        run: .\scripts\check_powershell.ps1
+      - name: Fresh clone bootstrap and offline regression checks
+        shell: powershell
+        run: |
+          & .\bootstrap.ps1 -Mode check
+          exit $LASTEXITCODE

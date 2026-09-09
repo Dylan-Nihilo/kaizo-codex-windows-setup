@@ -1,0 +1,14 @@
+provider.json
+provider.local.json
+auth.json
+.env
+.env.*
+*.log
+Last-error.txt
+logs/
+__pycache__/
+*.py[cod]
+dist/
+assets/*.zip
+assets/*.msi
+.DS_Store

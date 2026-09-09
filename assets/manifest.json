@@ -1,0 +1,26 @@
+{
+  "x64": {
+    "python": {
+      "url": "https://www.python.org/ftp/python/3.14.7/python-3.14.7-embeddable-amd64.zip",
+      "sha256": "76c3c0384ab3f822486f32450f3a4d20f5d65ad0ec32ee34290971aa0eb817e6",
+      "file": "python-3.14.7-embeddable-amd64.zip"
+    },
+    "cc": {
+      "url": "https://github.com/farion1231/cc-switch/releases/download/v3.20.2/CC-Switch-v3.20.2-Windows.msi",
+      "sha256": "8b235a80a995336de6c9fbefd9f29782be6899b32a071e4c8e682e82159a778b",
+      "file": "CC-Switch-v3.20.2-Windows.msi"
+    }
+  },
+  "arm64": {
+    "python": {
+      "url": "https://www.python.org/ftp/python/3.14.7/python-3.14.7-embeddable-arm64.zip",
+      "sha256": "b777fa08b68a177e350f8730c3e97a2b216d81e3eb5d183b039c65d43a6a2b3e",
+      "file": "python-3.14.7-embeddable-arm64.zip"
+    },
+    "cc": {
+      "url": "https://github.com/farion1231/cc-switch/releases/download/v3.20.2/CC-Switch-v3.20.2-Windows-arm64.msi",
+      "sha256": "f0a98e85170fedd4d0dd9d09f47d969e69dd72d6225cf5b7a5199984b1215a3c",
+      "file": "CC-Switch-v3.20.2-Windows-arm64.msi"
+    }
+  }
+}
